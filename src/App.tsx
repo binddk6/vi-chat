@@ -18,6 +18,22 @@ const App: React.FC = () => {
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
 
+  const setupLocalStream = async (): Promise<void> => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+      localStreamRef.current = stream;
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      setError(null);
+    } catch (err) {
+      setError(
+        "Camera and microphone permissions are required for this app to function."
+      );
+    }
+  };
+
   const handleError = useCallback((error: Error) => {
     console.error(error);
     setError(error.message);
@@ -25,6 +41,22 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    const checkPermissions = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true,
+        });
+        stream.getTracks().forEach((track) => track.stop());
+        setError(null);
+      } catch (err) {
+        setError(
+          "Camera and microphone permissions are required for this app to function."
+        );
+      }
+    };
+    setupLocalStream();
+    checkPermissions();
     socketRef.current = io(SERVER_URL);
 
     socketRef.current.on("connect", () => setIsConnected(true));
@@ -42,6 +74,9 @@ const App: React.FC = () => {
   }, []);
 
   const setupMediaStream = async (): Promise<MediaStream> => {
+    if (localStreamRef.current) {
+      return localStreamRef.current;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: true,
@@ -148,18 +183,22 @@ const App: React.FC = () => {
   };
 
   const toggleMute = (): void => {
-    const audioTrack = localStreamRef.current?.getAudioTracks()[0];
-    if (audioTrack) {
-      audioTrack.enabled = !audioTrack.enabled;
-      setIsMuted(!audioTrack.enabled);
+    if (localStreamRef.current) {
+      const audioTrack = localStreamRef.current.getAudioTracks()[0];
+      if (audioTrack) {
+        audioTrack.enabled = !audioTrack.enabled;
+        setIsMuted(!audioTrack.enabled);
+      }
     }
   };
 
   const toggleVideo = (): void => {
-    const videoTrack = localStreamRef.current?.getVideoTracks()[0];
-    if (videoTrack) {
-      videoTrack.enabled = !videoTrack.enabled;
-      setIsVideoEnabled(videoTrack.enabled);
+    if (localStreamRef.current) {
+      const videoTrack = localStreamRef.current.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.enabled = !videoTrack.enabled;
+        setIsVideoEnabled(videoTrack.enabled);
+      }
     }
   };
   const startCall = async () => {
@@ -167,17 +206,23 @@ const App: React.FC = () => {
     setIsInCall(true);
   };
   const endCall = () => {
-    // Implement call ending logic here
     peerConnectionRef.current?.close();
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     setIsInCall(false);
+    setupLocalStream(); // Restart the local stream after ending the call
   };
+
   return (
     <div className="App">
-      <h1>Video Call App</h1>
-      <p>Connection status: {isConnected ? "Connected" : "Disconnected"}</p>
+      <div className="header">
+        <h1>Banter</h1>
+        <p>
+          Status:
+          <span className={isConnected ? "connected" : "disconnected"} />
+        </p>
+      </div>
       {error && <p className="error">{error}</p>}
       <div className="video-container">
         <video
@@ -185,7 +230,7 @@ const App: React.FC = () => {
           autoPlay
           muted
           playsInline
-          className="local-video"
+          className="local-video mirror"
         />
         <video
           ref={remoteVideoRef}
