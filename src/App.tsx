@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 import "./App.css";
 
-const SERVER_URL = "https://vi.esyresource.com";
+const SERVER_URL = "http://localhost:3001";
 
 const App: React.FC = () => {
   const [isConnected, setIsConnected] = useState<boolean>(false);
@@ -11,12 +11,31 @@ const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [isInCall, setIsInCall] = useState<boolean>(false);
-
+  const [peers, setPeers] = useState<{
+    [id: string]: { peerConnection: RTCPeerConnection; stream?: MediaStream };
+  }>({});
+  const [bufferedICECandidates, setBufferedICECandidates] = useState<{
+    [peerId: string]: RTCIceCandidateInit[];
+  }>({});
   const socketRef = useRef<Socket | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+
+  const RenderRemoteVideos = () => {
+    return Object.entries(peers).map(([peerId, peer]) => (
+      <video
+        key={peerId}
+        ref={(el) => {
+          if (el && peer.stream) el.srcObject = peer.stream;
+        }}
+        autoPlay
+        playsInline
+        className="remote-video"
+      />
+    ));
+  };
 
   const setupLocalStream = async (): Promise<void> => {
     try {
@@ -61,7 +80,8 @@ const App: React.FC = () => {
 
     socketRef.current.on("connect", () => setIsConnected(true));
     socketRef.current.on("disconnect", () => setIsConnected(false));
-
+    socketRef.current.on("user_joined", handleUserJoined);
+    socketRef.current.on("user_left", handleUserLeft);
     socketRef.current.on("start_call", handleStartCall);
     socketRef.current.on("webrtc_offer", handleWebRTCOffer);
     socketRef.current.on("webrtc_answer", handleWebRTCAnswer);
@@ -72,6 +92,77 @@ const App: React.FC = () => {
       localStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
+
+  const createPeerConnection = (peerId: string): RTCPeerConnection => {
+    const peerConnection = new RTCPeerConnection();
+
+    // Add local tracks to the peer connection
+    localStreamRef.current?.getTracks().forEach((track) => {
+      peerConnection.addTrack(track, localStreamRef.current!);
+    });
+
+    // Handle ICE candidates
+    peerConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        socketRef.current?.emit("webrtc_ice_candidate", {
+          peerId,
+          candidate: event.candidate,
+        });
+      }
+    };
+
+    // Handle incoming tracks
+    peerConnection.ontrack = (event) => {
+      const stream = event.streams[0];
+      setPeers((prevPeers) => ({
+        ...prevPeers,
+        [peerId]: { ...prevPeers[peerId], stream },
+      }));
+    };
+
+    // Add buffered ICE candidates
+    const bufferedCandidates = bufferedICECandidates[peerId] || [];
+    bufferedCandidates.forEach((candidate) => {
+      peerConnection.addIceCandidate(candidate);
+    });
+
+    // Clear buffered candidates
+    setBufferedICECandidates((prev) => {
+      const newBuffered = { ...prev };
+      delete newBuffered[peerId];
+      return newBuffered;
+    });
+
+    return peerConnection;
+  };
+
+  const handleUserJoined = (peerId: string) => {
+    const peerConnection = createPeerConnection(peerId);
+    setPeers((prevPeers) => ({
+      ...prevPeers,
+      [peerId]: { peerConnection, stream: undefined },
+    }));
+
+    // Create and send offer
+    peerConnection
+      .createOffer()
+      .then((offer) => peerConnection.setLocalDescription(offer))
+      .then(() => {
+        socketRef.current?.emit("webrtc_offer", {
+          peerId,
+          offer: peerConnection.localDescription,
+        });
+      });
+  };
+
+  const handleUserLeft = (peerId: string) => {
+    setPeers((prevPeers) => {
+      const newPeers = { ...prevPeers };
+      newPeers[peerId].close();
+      delete newPeers[peerId];
+      return newPeers;
+    });
+  };
 
   const setupMediaStream = async (): Promise<MediaStream> => {
     if (localStreamRef.current) {
@@ -123,62 +214,52 @@ const App: React.FC = () => {
       setIsLoading(false);
     }
   };
+  const handleWebRTCOffer = async (data: {
+    peerId: string;
+    offer: RTCSessionDescriptionInit;
+  }) => {
+    const { peerId, offer } = data;
+    const peerConnection = createPeerConnection(peerId);
 
-  const handleWebRTCOffer = async (
-    offer: RTCSessionDescriptionInit
-  ): Promise<void> => {
-    try {
-      setIsLoading(true);
-      setError(null);
-      const stream = await setupMediaStream();
+    setPeers((prevPeers) => ({
+      ...prevPeers,
+      [peerId]: { peerConnection, stream: undefined },
+    }));
 
-      peerConnectionRef.current = new RTCPeerConnection();
+    await peerConnection.setRemoteDescription(offer);
+    const answer = await peerConnection.createAnswer();
+    await peerConnection.setLocalDescription(answer);
 
-      stream.getTracks().forEach((track) => {
-        peerConnectionRef.current?.addTrack(track, stream);
-      });
+    socketRef.current?.emit("webrtc_answer", { peerId, answer });
+  };
 
-      peerConnectionRef.current.onicecandidate = (event) => {
-        if (event.candidate) {
-          socketRef.current?.emit("webrtc_ice_candidate", event.candidate);
-        }
-      };
-
-      peerConnectionRef.current.ontrack = (event) => {
-        if (remoteVideoRef.current)
-          remoteVideoRef.current.srcObject = event.streams[0];
-      };
-
-      await peerConnectionRef.current.setRemoteDescription(offer);
-      const answer = await peerConnectionRef.current.createAnswer();
-      await peerConnectionRef.current.setLocalDescription(answer);
-      socketRef.current?.emit("webrtc_answer", answer);
-    } catch (error) {
-      handleError(error as Error);
-    } finally {
-      setIsLoading(false);
+  const handleWebRTCAnswer = async (data: {
+    peerId: string;
+    answer: RTCSessionDescriptionInit;
+  }) => {
+    const { peerId, answer } = data;
+    const peer = peers[peerId];
+    if (peer && peer.peerConnection) {
+      await peer.peerConnection.setRemoteDescription(answer);
+    } else {
+      console.error(`No peer connection found for ${peerId}`);
     }
   };
 
-  const handleWebRTCAnswer = async (
-    answer: RTCSessionDescriptionInit
-  ): Promise<void> => {
-    try {
-      await peerConnectionRef.current?.setRemoteDescription(answer);
-    } catch (error) {
-      handleError(error as Error);
-    }
-  };
-
-  const handleWebRTCIceCandidate = async (
-    candidate: RTCIceCandidateInit
-  ): Promise<void> => {
-    try {
-      if (peerConnectionRef.current) {
-        await peerConnectionRef.current.addIceCandidate(candidate);
-      }
-    } catch (error) {
-      handleError(error as Error);
+  const handleWebRTCIceCandidate = async (data: {
+    peerId: string;
+    candidate: RTCIceCandidateInit;
+  }) => {
+    const { peerId, candidate } = data;
+    const peer = peers[peerId];
+    if (peer && peer.peerConnection) {
+      await peer.peerConnection.addIceCandidate(candidate);
+    } else {
+      // Buffer the ICE candidate
+      setBufferedICECandidates((prev) => ({
+        ...prev,
+        [peerId]: [...(prev[peerId] || []), candidate],
+      }));
     }
   };
 
@@ -201,17 +282,21 @@ const App: React.FC = () => {
       }
     }
   };
+
   const startCall = async () => {
-    await handleStartCall();
+    await setupMediaStream();
+    socketRef.current?.emit("join_call");
     setIsInCall(true);
   };
+
   const endCall = () => {
-    peerConnectionRef.current?.close();
+    Object.values(peers).forEach((peer) => peer.close());
+    setPeers({});
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
-    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     setIsInCall(false);
-    setupLocalStream(); // Restart the local stream after ending the call
+    socketRef.current?.emit("leave_call");
+    setupLocalStream();
   };
 
   return (
@@ -232,12 +317,13 @@ const App: React.FC = () => {
           playsInline
           className="local-video mirror"
         />
-        <video
+        {/* <video
           ref={remoteVideoRef}
           autoPlay
           playsInline
           className="remote-video"
-        />
+        /> */}
+        <RenderRemoteVideos />
       </div>
       <div className="controls">
         {!isInCall ? (
