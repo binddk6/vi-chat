@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 import "./App.css";
 
-const SERVER_URL = "http://vi.esyresource.com";
+const SERVER_URL = "https://vi.esyresource.com";
 
 const App: React.FC = () => {
   const [isConnected, setIsConnected] = useState<boolean>(false);
